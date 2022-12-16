@@ -1,0 +1,854 @@
+---
+title: "Bayesian analysis of COVID-19"
+author: "Luis Rojo-González"
+date: ""
+output:
+  pdf_document:
+    fig_caption: yes
+    toc: true # table of content true
+    toc_depth: 3  # upto three depths of headings (specified by #, ## and ###)
+    number_sections: true  ## if you want number sections at each table header
+    highlight: tango  # specifies the syntax highlighting style
+  header-includes:
+  - \usepackage{float}
+  - \usepackage{amsmath}
+  - \usepackage[spanish]{babel}
+  - \usepackage[utf8]{inputenc}
+  - \usepackage{natbib}
+  - \usepackage{booktabs}
+  html_document:
+    df_print: paged
+params:
+  seed: 12345
+abstract: ""
+---
+
+```{r include = FALSE}
+knitr::opts_chunk$set(echo=FALSE)
+```
+
+```{r echo = FALSE}
+# Working directory
+setwd("~/Desktop/UPC/BayesianAnalysis/Project")
+```
+
+```{r message = FALSE, warning = FALSE}
+# Libraries
+library(readr)
+library(dplyr)
+library(tidyr)
+library(xtable)
+library(cowplot)
+library(ggpubr)
+library(ggplot2)
+library(knitr)
+library(ggalt)
+library(purrr)
+library(rstan)
+library(bayesplot)
+library(zoo)
+options(mc.cores = parallel::detectCores())
+```
+
+```{r message=FALSE, warning=FALSE}
+# Loading dataset
+# confirmed cases
+confirmed = read_csv("https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_confirmed_global.csv")
+confirmed$case = "confirmed"
+
+# death cases
+death = read_csv("https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_deaths_global.csv")
+death$case = "death"
+
+# Recovered cases
+recovered = read_csv("https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_recovered_global.csv")
+recovered$case = "recovered"
+
+data = rbind(confirmed, death, recovered)
+
+# transforming data
+data = data %>% dplyr::select(-c("Province/State","Lat","Long"))
+data$`Country/Region` = as.factor(data$`Country/Region`)
+data$case = as.factor(data$case)
+
+# consolidating data
+data.1 = aggregate(. ~ `Country/Region` + case, data = data, FUN = "sum")
+```
+
+```{r}
+aux = data.1 %>% gather(key = "date", value = "number", -`Country/Region`, -case)
+aux$date = as.Date(as.POSIXct(strptime(aux$date, "%m/%d/%y")))
+```
+
+```{r}
+datos = aux %>% group_by(`Country/Region`, case) %>%
+  mutate(number = number - lag(number, k = -1)) %>%
+  filter(`Country/Region` == "Spain") %>%
+  na.omit() %>%
+  ungroup() %>%
+  group_by(case) %>%
+  filter(number > 0, number <= max(number)) %>%
+  dplyr::select(-c(`Country/Region`)) %>%
+  spread(case, number) %>%
+  replace(is.na(.), 0) %>%
+  filter(date >= as.numeric(as.Date("2020-03-01"))) %>%
+  filter(date <= as.numeric(as.Date("2020-04-30")))
+
+horizon = seq(from = as.Date("2020-03-01"),
+              to = as.Date("2020-04-30"),
+              by = 1)
+
+datos = left_join(data.frame(date = horizon), datos, by = c("date"))
+datos = datos %>% replace(is.na(.), 0)
+colnames(datos) = c("Date", "Confirmed", "Death", "Recovered")
+  
+write.csv(datos, "COVID.csv")
+```
+
+\section{Introduction} \label{sec:intro}
+
+How COVID-19 pandemic behaves throughout time? this question might be the most important to find an answer for (as soon as possible) for the last time. Since few months we are living a pandemic of an unknown virus COVID-19, the also known as \textit{corona virus}. On this way, it is important to anticipate the number of new cases on a daily basis to take care about healthcare systems as well as the budget to dedicate to this disease.
+
+This work addresses the problem of how to calibrate a Markov Chain to predict COVID-19's behaviour using Poisson processes to find the transition rates involved into this chain using Bayesian analysis.
+
+\section{Descriptive analysis} \label{sec:eda}
+
+We use the time series reported by Johns Hopkins University, where Table \ref{tab:summary1} shows some important statistics about the pandemic behavior for this particular case of Spain by month and kind of observed case considering its absolute value, not the cumulative that original data set reports. It is possible to see that here is increasing behavior throughout time with special attention on the last two months, where more than 100,000 confirmed cases had reported; nevertheless, it is important to highlight that April's recovered cases are fourth times March's. On the other hand, Figure \ref{fig:tsplot} shows the time series for cumulative cases by kind of case and month, where two vertical lines represents the date of the lock-down and when its expected effect was as two inflection points.
+
+It is clearly to see that these so-called curves are obviously dependent on each other, and of course from another of non-infected people with a decreasing trend. Nonetheless, the scenario from the point of view of death people seems to be under control although the limited resources of healthcare systems and lack of information about this novel virus.
+
+```{r message=FALSE, warning=FALSE, fig.height = 5, fig.width = 5, fig.cap = "\\label{fig:ts}Time series plot by cases."}
+p1.aux = datos %>% # mutate(day = c(1:(nrow(aux)))) %>% select(-date) %>%
+  gather(key = "Case", value = "Count", -Date) %>%
+  group_by(Case)
+  # mutate(Count = Count) %>%
+# p1.aux$Case = factor(p1.aux$Case, levels = c("Confirmed", "Recovered", "Death"))
+(p1 = p1.aux %>%
+    ggplot() + geom_col(aes(x = Date, y = Count)) +
+    # mesures of the country
+    geom_vline(xintercept = as.numeric(as.Date("2020-03-14")),
+             linetype = "twodash", col = "red", size = 2) +
+    # geom_text(x = as.numeric(as.Date("2020-03-14")),
+    #           y = 100000, label = "", angle = 90, vjust = -0.5) + # lock-down
+    geom_vline(xintercept = as.numeric(as.Date("2020-03-28")),
+               linetype = "twodash", col = "green", size = 2) +
+    # geom_text(x = as.numeric(as.Date("2020-03-28")),
+    #           y = 100000, label = "", angle = 90, vjust = -0.5) + # effect
+    facet_wrap(factor(Case, levels = c("Confirmed", "Recovered", "Death")) ~ .,
+               scales = "free", strip.position = "top", dir = "h") +
+    labs(x = "", y = "") +
+    coord_flip() +
+    theme_bw() +
+    theme(plot.title = element_text(hjust = 0.5),
+          # legend.position = "bottom",
+          text = element_text(size = 25, family = "Times"),
+          legend.position = "none",
+          panel.border=element_rect(fill = NA),
+          plot.margin = unit(c(0.2, 0.7, -0.3, -0.8), "cm"))) #top, right, bottom, left
+ggsave("Figures/tsplot.png", width = 40, height = 15, units = "cm")
+```
+
+```{r results = 'asis'}
+descriptive = datos %>%
+  gather(key = "Case", value = "Count", -Date) %>%
+  group_by(months(Date), Case) %>%
+  dplyr::summarise(n = sum(Count),
+                   Q1 = quantile(Count, probs = 0.25),
+                   Mean = mean(Count),
+                   Median = median(Count),
+                   Q3 = quantile(Count, probs = 0.75),
+                   SD = sd(Count)) %>%
+  replace(is.na(.), 0) %>%
+  gather(key = "Statistic", value = "value", -Case, -"months(Date)") %>%
+  spread(key = "months(Date)", value = "value")
+
+descriptive = data.frame(Case = descriptive$Case, Statistic = descriptive$Statistic,
+                         March = descriptive$March, April = descriptive$April)
+
+print(xtable(descriptive,
+             digits = 2, label = "tab:summary1",
+             caption = "Summary of observed cases by month."),
+      caption.placement = "top", comment = FALSE, include.rownames = FALSE,
+      include.colnames = TRUE)
+```
+
+\section{Statement of the problem} \label{sec:statement}
+
+We can recognize that curves could be characterized by using Poisson processes with different intensities and time windows. Let's denote $N_s(t)$ the number of sick people at time $t$, $N_r(t)$ the number of recovered people at time $t$ and $N_d(t)$ the number of death people at time $t$. Then, we know that these processes are defined a Poisson distribution with parameter $\lambda_t$. On this way, it is possible to state the following: \textit{Once a person is a confirmed case (sick) there are two possible paths after a time window, that person will be health or death}; also, we know that the elapsed time to the change of group is not a fixed number of days but a random variable. Thus, be the elapsed time to change to recovered or death as $t_r$ and $t_d$, we can define the dynamic as Section \ref{def:dynamic} shows.
+
+\subsection{Structural equations} \label{def:dynamic}
+
+Let's consider a person who get positive to the virus get health or die after a time. Thus, consider the number of sick people today is equal to recovered people after $t_r$ days and death ones after $t_d$ days which, if $N_i(t)$ denotes the number of people in each condition, the phenomena is defined by
+
+\begin{equation} \label{eq:poisson1}
+Y_s(t+t_s) = Y_r(t+t_r) + Y_d(t+t_d)
+\end{equation}
+
+Thus, we can consider the following properties:
+
+\begin{enumerate}
+\item $Y_r(t_r) = N_r(t+t_r) - N_s(t)$ the number of recovered people between time $t$ and elapsed time $t_r$ such that $Y_r(t_r) \sim Poisson(\lambda_r t_r)$, where $\lambda_r$ represents the number of recovered people by day.
+\item $Y_d(t_d) = N_d(t+t_d) - N_s(t)$ the number of death people between time $t$ and elapsed time $t_d$ such that $Y_d(t_d) \sim Poisson(\lambda_d t_d)$, where $\lambda_d$ represents the number of death people by day.
+\end{enumerate}
+
+therefore, we know that $Y_r(t+t_r) + Y_d(t+t_d) = Y_s(t+t_s) \sim Poisson(\lambda_s t_s)$, where $\lambda_s t_s = \lambda_r t_r + \lambda_d t_d$.
+
+\section{Bayesian modeling} \label{sec:modeling}
+
+\subsection{Prior distributions} \label{subsec:priors}
+
+We know that the intensities $\lambda_r$ and $\lambda_d$ are measured in (people/day) and it seems to be the number of infected people are in a certain interval because finite population, then it makes sense to think in a gamma distribution then, elapsed times $t_r$ and $t_d$ are the day at which once the person get sick is recovered or death, respectively, thus it is possible to see that this variable is gamma distributed as well. Table \ref{tab:priorparam} indicates those parameters for prior distribution that seem to be represent the believe in a good manner.
+
+```{r message=FALSE, warning=FALSE, fig.height = 5, fig.width = 10, fig.cap = "\\label{fig:lambdaprior}Intensities prior distributions."}
+# infected
+expected.s = 5000
+variance.s = 100000
+beta.s = expected.s/variance.s
+alpha.s = expected.s^2/variance.s
+
+# recovered
+expected.r = 3500
+variance.r = 100000
+beta.r = expected.r/variance.r
+alpha.r = expected.r^2/variance.r
+
+# death
+expected.d = 500
+variance.d = variance.r
+beta.d = expected.d/variance.d
+alpha.d = expected.d^2/variance.d
+
+png("Figures/intensity.png", width = 600, height = 350)
+par(mfrow = c(1, 3))
+curve(dgamma(x, shape = alpha.s, rate = beta.s),
+      xlab = "Intensity to get sick",
+      ylab = "density",
+      xlim = c(max(0, expected.s-4*sqrt(variance.s)),
+               expected.s+4*sqrt(variance.s)))
+curve(dgamma(x, shape = alpha.r, rate = beta.r),
+      xlab = "Intensity to recover",
+      ylab = "",
+      xlim = c(max(0, expected.r-4*sqrt(variance.r)),
+               expected.r+4*sqrt(variance.r)))
+curve(dgamma(x, shape = alpha.d, rate = beta.d),
+      xlab = "Intensity to death",
+      ylab = "",
+      xlim = c(max(0, expected.d-4*sqrt(variance.d)),
+               expected.d+4*sqrt(variance.d)))
+```
+
+```{r message=FALSE, warning=FALSE, fig.height = 5, fig.width = 10, fig.cap = "\\label{fig:timesprior}Elapsed time prior distributions."}
+# infected
+expected.ts = 6.5
+variance.ts = sqrt(2.6)
+beta.ts = expected.ts/variance.ts
+alpha.ts = expected.ts^2/variance.ts
+
+# recovered
+expected.tr = 10
+variance.tr = 20
+beta.tr = expected.tr/variance.tr
+alpha.tr = expected.tr^2/variance.tr
+
+# death
+expected.td = 20
+variance.td = sqrt(10)
+beta.td = expected.td/variance.td
+alpha.td = expected.td^2/variance.td
+
+png("Figures/time.png", width = 600, height = 350)
+par(mfrow = c(1, 3))
+curve(dgamma(x, shape = alpha.ts, rate = beta.ts),
+      xlab = "Elapsed time to get sick",
+      ylab = "density",
+      xlim = c(max(0, expected.ts-4*sqrt(variance.ts)),
+               expected.ts+4*sqrt(variance.ts)))
+curve(dgamma(x, shape = alpha.tr, rate = beta.tr),
+      xlab = "Elapsed time to recover",
+      ylab = "density",
+      xlim = c(max(0, expected.tr-4*sqrt(variance.tr)),
+               expected.tr+4*sqrt(variance.tr)))
+curve(dgamma(x, shape = alpha.td, rate = beta.td),
+      xlab = "Elapsed time to death",
+      ylab = "density",
+      xlim = c(max(0, expected.td-4*sqrt(variance.td)),
+               expected.td+4*sqrt(variance.td)))
+```
+
+```{r results = 'asis'}
+prior = data.frame(Parameter = c("lambda.s", "lambda.r", "lambda.d",
+                                 "t.s", "t.r", "t.d"),
+                   alpha = c(alpha.s, alpha.r, alpha.d,
+                             alpha.ts, alpha.tr, alpha.td),
+                   beta = c(beta.ts, beta.tr, beta.td,
+                            beta.ts, beta.tr, beta.td))
+print(xtable(prior,
+             digits = 2, label = "tab:priorparam",
+             caption = "Parameters for Gamma distribution for each prior."),
+             caption.placement = "top", comment = FALSE, include.rownames = FALSE)
+```
+
+\subsection{Bayesian hypothesis test: elapsed time to change of group} \label{subsec:hypothesis}
+
+Once we have the distribution of the curves, it is possible to check some conditions of the processes. Considering the elapsed times $t_r$ and $t_d$ as random variables the question is whether they are equal. For this reason, we perform a bayesian hypothesis test such that 
+
+\begin{equation*}
+H_1: y_E(t) \sim Pois((\lambda_R + \lambda_M)t), \quad H_2: y_E(t) \sim Pois((\lambda_R + \lambda_M)t)
+\end{equation*}
+
+Now, we know that the intesities $\lambda_r$ and $\lambda_d$ are measured in (people/day) and it seems to be the number of infected people are in a certain interval because finite population, then it makes sense to think in a gamma distribution. Finally, the probability of the hypothesis is true is defined as
+
+\begin{equation} \label{eq:test}
+Pr(H_i | y) = \frac{\pi(H_i) Pr(y | H_i)}{Pr(y)}
+\end{equation}
+
+```{r}
+datos.stan = datos #%>%
+  # group_by(`Country/Region`, case) %>%
+  # mutate(number = number - lag(number, k = 1)) %>%
+  # filter(`Country/Region` == "Spain") %>%
+  # na.omit() %>%
+  # ungroup() %>%
+  # group_by(case) %>%
+  # filter(number > 0, number <= max(number)) %>%
+  # dplyr::select(-c(`Country/Region`)) %>%
+  # spread(case, number) %>%
+  # replace(is.na(.), 0) #%>%
+```
+
+```{r message=FALSE, warning=FALSE}
+# simulation control
+set.seed(params$seed)
+n.sim = 10^5
+
+# hypotheses prior information
+pi.h1 = 0.5
+pi.h2 = 1 - pi.h1
+
+# -------- intensities ------
+delta_lambda = 0.01
+
+### recovered
+seq_lambda.r = seq(max(expected.r-4*sqrt(variance.r), 0),
+                   expected.r+4*sqrt(variance.r), delta_lambda)
+p.lambda.r = sample(dgamma(seq_lambda.r, shape = alpha.r, rate = beta.r),
+                    size = n.sim, replace = TRUE)
+### death
+seq_lambda.d = seq(max(expected.d-4*sqrt(variance.d), 0),
+                   expected.d+4*sqrt(variance.d), delta_lambda)
+p.lambda.d = sample(dgamma(seq_lambda.d, shape = alpha.d, rate = beta.d),
+                    size = n.sim, replace = TRUE)
+
+# -------- elapsed time ------
+
+delta_t = 0.01
+### recovered
+seq_tr = seq(max(expected.tr-4*sqrt(variance.tr), 0),
+             expected.tr+4*sqrt(variance.tr), delta_t)
+p.tr = sample(dgamma(seq_tr, shape = alpha.tr, rate = beta.tr),
+                    size = n.sim, replace = TRUE)
+### death
+seq_td = seq(max(expected.td-4*sqrt(variance.td), 0),
+             expected.td+4*sqrt(variance.td), delta_t)
+p.td = sample(dgamma(seq_td, shape = alpha.td, rate = beta.td),
+                    size = n.sim, replace = TRUE)
+
+# tiempos distintos
+model.h1 = sum(dpois(datos.stan$Confirmed,
+                     lambda = (p.lambda.r*p.tr+p.lambda.d*p.td)))
+
+p.tdr = sample(c(p.tr, p.td), size = n.sim, replace = TRUE)
+
+# tiempos iguales
+model.h2 = sum(dpois(datos.stan$Confirmed,
+                     lambda = (p.lambda.r+p.lambda.d)*p.tdr))
+
+p.h1 = (pi.h1*model.h1)/(pi.h1*model.h1+pi.h2*model.h2)
+p.h2 = (pi.h2*model.h2)/(pi.h1*model.h1+pi.h2*model.h2)
+paste("The probability of elapsed times are different is equal to",
+      round(p.h1*100, 2), "%", "whereas the probability to be equal is",
+      round(p.h2*100, 2), "%")
+```
+
+\subsection{Posterior distribution} \label{subsec:posterior}
+
+Such as Table \ref{tab:summarymodel1} shows, obtained results can be considered as a good fit due to the $\hat{R} = 1$ and the confidence intervals are not too large with respect to the mean. Also, Figure \ref{fig:posterior} shows the posterior distribution for each estimated parameter of elapsed time (\textbf{A}) and intensity (\textbf{B}). Those results are saying that:
+
+\begin{enumerate}
+\item The elapsed time to get sick, i.e. the incubation time, is between 16 and 19 days, but the most likely period is of 17 or 18 days. The most likely time to recover is between 10 and 14 days, but can be up to 12 days. Whereas, the time to die is 19 days with possibilities to find cases from 14 to 25 days.
+\item The number of daily confirmed cases is between 4,721 and 5,478; the daily number of person who get recover is 3346 people in mean and those persons who died is between 397 and 675 people.
+\end{enumerate}
+
+```{r}
+data_list = list(## observed cases
+                 N = nrow(datos.stan),
+                 s = cumsum(datos.stan$Confirmed),
+                 r = cumsum(datos.stan$Recovered),
+                 d = cumsum(datos.stan$Death),
+                 ## parameter for priors
+                 # intensities
+                 alphas = alpha.s,
+                 betas = beta.s,
+                 alphar = alpha.r,
+                 betar = beta.r,
+                 alphad = alpha.d,
+                 betad = beta.d,
+                 # elapsed time
+                 alphats = alpha.ts,
+                 betats = beta.ts,
+                 alphatr = alpha.tr,
+                 betatr = beta.tr,
+                 alphatd = alpha.td,
+                 betatd = beta.td)
+```
+
+```{r message=FALSE, warning=FALSE, results = 'hide'}
+# closeAllConnections()
+model1 = stan("project.stan", iter = 1000, chains = 4,
+              data = data_list, seed = params$seed, control = list(max_treedepth = 15),
+              verbose = FALSE)
+```
+
+```{r results = 'asis'}
+summary1 = summary(model1, pars = c("ts", "tr", "td", "lambdas", "lambdar", "lambdad"),
+                   probs = c(0.05, 0.95))$summary
+print(xtable(summary1,
+             digits = 2, label = "tab:summarymodel1",
+             caption = "Summary of stan model."),
+             caption.placement = "top", comment = FALSE, include.rownames = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE, fig.height = 5, fig.width = 10, fig.cap = "\\label{fig:traceplot}Traceplot for simulation."}
+traceplot(model1) +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5),
+        text=element_text(size = 16),
+        legend.position = "bottom")
+ggsave("Figures/traceplot1.png")
+```
+
+```{r}
+ts_post = rstan::extract(model1, "ts")[[1]]
+tr_post = rstan::extract(model1, "tr")[[1]]
+td_post = rstan::extract(model1, "td")[[1]]
+lambdas_post = rstan::extract(model1, "lambdas")[[1]]
+lambdar_post = rstan::extract(model1, "lambdar")[[1]]
+lambdad_post = rstan::extract(model1, "lambdad")[[1]]
+```
+
+```{r message=FALSE, warning=FALSE, fig.height = 5, fig.width = 10, fig.cap = "\\label{fig:elapsedposterior}Posterior distribution for elapsed times."}
+posterior = as.data.frame(model1)
+post.t = posterior %>% dplyr::select(c("ts", "tr", "td"))
+colnames(post.t) = c("Confirmed", "Recovered", "Death")
+post.t = post.t %>%
+  gather(key = "Time", value = "Days") %>%
+  mutate(Time = factor(Time, levels = c("Confirmed", "Recovered", "Death"))) %>%
+  ggplot() + geom_density(aes(x = Days, fill = Time), alpha = 0.3) +
+  theme_bw() +
+  labs(fill = "") +
+  ylab("density") +
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 25, family = "Times"),
+        legend.position = "bottom",
+        panel.border = element_rect(fill = NA),
+        plot.margin = unit(c(1, 1, 0, 0.5), "cm")) #top, right, bottom, left
+ggsave(plot = post.t, filename = "Figures/elapsedtime1.png",
+       width = 15, height = 15, units = "cm")
+```
+
+```{r message=FALSE, warning=FALSE, fig.height = 5, fig.width = 10, fig.cap = "\\label{fig:intensityposterior}Posterior distribution for intensities."}
+post.lambda = posterior %>% dplyr::select(c("lambdas", "lambdar", "lambdad"))
+colnames(post.lambda) = c("Confirmed", "Recovered", "Death")
+post.lambda = post.lambda %>%
+  gather(key = "Time", value = "People") %>%
+  mutate(Time = factor(Time, levels = c("Confirmed", "Recovered", "Death"))) %>%
+  ggplot() + geom_density(aes(x = People, fill = Time), alpha = 0.3) +
+  theme_bw() +
+  labs(fill = "") +
+  ylab("") +
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 25, family = "Times"),
+        legend.position = "bottom",
+        panel.border = element_rect(fill = NA),
+        plot.margin = unit(c(1, 1, 0, 0), "cm")) #top, right, bottom, left
+ggsave(plot = post.lambda, filename = "Figures/intensities1.png",
+       width = 15, height = 15, units = "cm")
+```
+
+```{r message=FALSE, warning=FALSE, fig.height = 5, fig.width = 10, fig.cap = "\\label{fig:posteriors}Posterior distributions for intensities and elapsed times."}
+ggpubr::ggarrange(post.t, post.lambda, labels = c("a)", "b)"), common.legend = TRUE,
+                  legend = "bottom", align = "h", nrow = 1)
+ggsave("Figures/posterior1.png", width = 30, height = 15, units = "cm")
+```
+
+\section{Discrete Markov Chain} \label{sec:mc}
+
+\subsection{State equations} \label{subsec:mceq}
+
+We state the dynamic of the pandemic such as Figure \ref{fig:MC} shows considering that: i) health, are people that never have been positive to COVID-19; ii) sick, are currently infected people of COVID-19; iii) recover, are recovered people of COVID-19; and iv) death, are death people due to COVID-19.
+
+\begin{figure}
+\centering
+\caption{Markov Chain for COVID-19 pandemic dynamic.}
+\label{fig:MC}
+\includegraphics[scale=0.32]{Figures/MarkovChain.png}
+\end{figure}
+
+Then, considering the elements given in Definition \ref{def:dynamic}, we can define the system throughout transition rates as follows:
+
+Let $x_{i,j}(t)$ be the transition rate from state $i$ and $j$ at time $t$ and $Y_{i \in \lbrace h,s,r,d \rbrace }(t)$ be the people in state $i$ at time $t$. On the other hand, consider $t_d$ and $t_r$ as the time-lag of the series to change from sick $s$ to death $d$ or recovered $r$, respectively. Thus, for $t \geq max \lbrace t_d, t_r \rbrace$ the equations are defined by:
+
+\begin{align*}
+Y_h(t+1) = & \, x_{h,h}(t) Y_h(t) - x_{h,e}(t) Y_h(t) \\
+Y_s(t+1) = & \, x_{h,s}(t) Y_h(t) + x_{r,s}(t) Y_r(t) + x_{s,s}(t) Y_s(t) \\
+& \, -x_{s,r}(t) Y_s(t-t_r) - x_{s,d}(t) Y_s(t-t_m) \\
+Y_r(t+1) = & \, x_{s,r}(t) Y_s(t-t_r) - x_{r,s}(t) Y_r(t) \\
+Y_d(t+1) = & \, x_{s,d}(t) Y_s(t-t_d) + Y_d(t)
+\end{align*}
+
+\subsection{Transition rates estimation} \label{subsec:transition}
+
+In Section \ref{sec:modeling} we got the probability of time to recover or die were equal, also we computed the posterior distribution for elapsed times and intensities in a Poisson process; another way to use this results is on a discrete Markov Chain. Nonetheless, we must know the transition probabilities between states defined above. 
+It is clearly to see that we can compute these required transition rates such as follows
+
+\begin{align}
+x_{h,h}(t) = & 1-\lambda_s/Y_h(t-t_s) \label{eq:hh} \\
+x_{h,s}(t) = & \lambda_s/Y_h(t-t_s) \label{eq:xhs} \\
+x_{s,r}(t) = & \lambda_r/Y_s(t-t_r) \label{eq:xsr} \\ 
+x_{s,d}(t) = & \lambda_d/Y_s(t-t_d) \label{eq:xsd} \\
+x_{s,s}(t) = & 1 - x_{s,r}(t) - x_{s,d}(t) \label{eq:xss} \\
+x_{d,d}(t) = & 1 \label{eq:xdd}
+\end{align}
+
+Finally, we have that there is not certain in how much people get sick back so it is a free parameter which we based the simulation on different scenarios, thus $x_{r,r}=1-x_{r,s}$.
+
+\subsection{Simulation} \label{subsec:simulation}
+
+If we start with a population of 50 million people we have that
+
+\begin{align*}
+Y_h(t+1) = & \, x_{h,h}(t) Y_h(t) - x_{h,s}(t) Y_h(t) \\
+Y_s(t+1) = & \, x_{h,s}(t) Y_h(t) + x_{r,s}(t) Y_r(t) + x_{s,s}(t) Y_s(t) \\
+& \, -x_{s,r}(t) Y_s(t) - x_{s,d}(t) Y_s(t) \\
+Y_r(t+1) = & \, x_{s,r}(t) Y_s(t) - x_{r,s}(t) Y_r(t) + x_{r,r}(t) Y_r(t)\\
+Y_d(t+1) = & \, x_{s,d}(t) Y_s(t) + Y_d(t)
+\end{align*}
+
+```{r warning=FALSE, message=FALSE}
+# set.seed(params$seed)
+# pop = 50000000
+# health = rep(pop, length(horizon))
+# x.rs = 0 # tasa de recontagio
+# sim = data.frame(date = horizon,
+#                  confirmed = 0,
+#                  recovered = 0,
+#                  death = 0)
+# tasa = data.frame(date = horizon,
+#                   confirmed = 0,
+#                   recovered = 0,
+#                   death = 0)
+# i = 1
+# while (health > 0 & i < length(horizon)) {
+#   #------- calculo las tasas ----
+#   # si la probabilidad esta mas cerca de que los tiempos sean distintos
+#   lambdas.aux = sample(lambdas_post, 1)
+#   lambdar.aux = sample(lambdar_post, 1)
+#   lambdad.aux = sample(lambdad_post, 1)
+#   ts.aux = round(i - sample(ts_post, 1))
+#   u = runif(1)
+#   if(abs(u - p.h1) < abs(u - p.h2)) {
+#     tr.aux = round(i - sample(tr_post, 1))
+#     td.aux = round(i - sample(td_post, 1))
+#   } else {
+#     tr.aux = round(i - sample(c(tr_post, ts_post), 1))
+#     td.aux = tr.aux
+#   }
+#   x.hs = 0.0001
+#   tasa[i+1, 2] = round(x.hs, 4)
+#   x.sr = 0.8
+#   tasa[i+1, 3] = round(x.sr, 4)
+#   x.sd = 0.15
+#   tasa[i+1, 4] = round(x.sd, 4)
+#   # calculo tasas suma 1
+#   x.hh = 1 - x.hs
+#   x.ss = 1 - x.sr - x.sd
+#   x.rr = 1 - x.rs
+#   x.dd = 1
+#   # ------- cadena de markov -------
+#   # ts.aux = ifelse(ts.aux >= 1, ts.aux, 1)
+#   # tr.aux = ifelse(tr.aux >= 1, tr.aux, 1)
+#   # td.aux = ifelse(td.aux >= 1, td.aux, 1)
+#   # poblacion sana
+#   health[i+1] = ifelse(ts.aux >= 1,
+#                        x.hh*health[i] - x.hs*health[ts.aux],
+#                        health[i])
+#   health[i+1] = max(health[i+1], 0)
+#   # contagiados
+#   sim[i+1, 2] = x.ss*sim[ts.aux, 2] +
+#     x.hs*health[ts.aux] +
+#     x.rs*sim[ts.aux, 3] -
+#     x.sr*sim[tr.aux, 2] -
+#     x.sd*sim[td.aux, 2]
+#   sim[i+1, 2] = max(sim[i+1, 2], 0)
+#   # recuperados x.rr*sim[i, 3] +
+#   sim[i+1, 3] = x.sr*sim[tr.aux, 2] -
+#     x.rs*sim[ts.aux, 3]
+#   sim[i+1, 3] = max(sim[i+1, 3], 0)
+#   # muertos x.dd*sim[i, 4] +
+#   sim[i+1, 4] = x.sd*sim[td.aux, 2]
+#   sim[i+1, 4] = max(sim[i+1, 4], 0)
+#   # if (i == 30) break
+#   i = i + 1
+# }
+```
+
+```{r warning=FALSE, message=FALSE}
+set.seed(params$seed)
+# n.sim = 10^5
+pop = 47000000
+health = rep(pop, length(horizon))
+x.rs = 0 # tasa de recontagio
+sim = data.frame(Date = horizon,
+                 Confirmed = 0,
+                 Recovered = 0,
+                 Death = 0)
+tasa = data.frame(Date = horizon,
+                  Confirmed = 0,
+                  Recovered = 0,
+                  Death = 0)
+i = 1
+while (health > 0 & i < length(horizon)) {
+  #------- calculo las tasas ----
+  # si la probabilidad esta mas cerca de que los tiempos sean distintos
+  # index = 
+  lambdas.aux = sample(lambdas_post, 1)
+  lambdar.aux = sample(lambdar_post, 1)
+  lambdad.aux = sample(lambdad_post, 1)
+  ts.aux = round(i - sample(ts_post, 1))
+  u = runif(1)
+  if(abs(u - p.h1) < abs(u - p.h2)) {
+    tr.aux = round(i - sample(tr_post, 1))
+    td.aux = round(i - sample(td_post, 1))
+  } else {
+    tr.aux = round(i - sample(c(tr_post, ts_post), 1))
+    td.aux = tr.aux
+  }
+  x.hs = runif(n = 1, min = 0.019, max = 0.0192) # infection rate
+  tasa[i+1, 2] = round(x.hs, 4)
+  x.sr = 0.87 # recovery rate
+  tasa[i+1, 3] = round(x.sr, 4)
+  x.sd = 0.003 # mortality rate
+  tasa[i+1, 4] = round(x.sd, 4)
+  # calculo tasas suma 1
+  x.hh = 1 - x.hs
+  x.ss = 1 - x.sr - x.sd
+  x.rr = 1 - x.rs
+  x.dd = 1
+  # ------- cadena de markov -------
+  # poblacion sana
+  health[i+1] = ifelse(ts.aux >= 1, x.hh*health[i] - x.hs*health[ts.aux],
+                       health[i] - min(rpois(n = n.sim, lambda = lambdas.aux)))
+  health[i+1] = max(health[i+1], 0)
+  # contagiados x.ss*ifelse(ts.aux >= 1, sim[ts.aux, 2], 0) +
+  sim[i+1, 2] = ifelse(ts.aux >= 1, x.hs*health[ts.aux],
+           min(rpois(n = n.sim, lambda = lambdas.aux))) +
+    x.rs*ifelse(ts.aux >= 1, sim[ts.aux, 3], 0) -
+    x.sr*ifelse(tr.aux >= 1, sim[tr.aux, 2], 0) -
+    x.sd*ifelse(td.aux >= 1, sim[td.aux, 2], 0)
+  sim[i+1, 2] = max(sim[i+1, 2], 0)
+  # recuperados x.rr*sim[i, 3] +
+  sim[i+1, 3] = x.sr*ifelse(tr.aux >= 1, sim[tr.aux, 2], 0) -
+    x.rs*ifelse(ts.aux >= 1, sim[ts.aux, 3], 0)
+  sim[i+1, 3] = max(sim[i+1, 3], 0)
+  # muertos x.dd*sim[i, 4] +
+  sim[i+1, 4] = x.sd*ifelse(td.aux >= 1, sim[td.aux, 2], 0)
+  sim[i+1, 4] = max(sim[i+1, 4], 0)
+  # if (i == 30) break
+  i = i + 1
+}
+```
+
+```{r}
+paste("Infectados: (Sim)", round(sum(sim$Confirmed)), "(Real)", sum(datos$Confirmed))
+paste("Recuperados: (Sim)", round(sum(sim$Recovered)), "(Real)", sum(datos$Recovered))
+paste("Muertos: (Sim)", round(sum(sim$Death)), "(Real)", sum(datos$Death))
+```
+
+\section{Model validation} \label{sec:val}
+
+```{r message=FALSE, warning=FALSE, fig.height = 5, fig.width = 8, fig.cap = "\\label{fig:simulation}Simulation till the end of the year."}
+p2.1 = datos %>% # mutate(day = c(1:(nrow(aux)))) %>% select(-date) %>%
+  gather(key = "Case", value = "Count", -Date) %>%
+  group_by(Case) %>%
+  # mutate(Count = Count - lag(Count, k = 1)) %>%
+  mutate(Serie = "Real")
+
+p2.2 = sim %>%
+  gather(key = "Case", value = "Count", -Date) %>%
+  group_by(Case) %>%
+  # mutate(Count = Count - lag(Count, k = 1)) %>%
+  mutate(Serie = "Simulation")
+
+val = rbind(p2.1, p2.2)
+
+val %>% ggplot() + geom_boxplot(aes(x = Serie, y = Count),
+                                fill = "grey",
+                                alpha = 1) +
+  facet_grid(factor(Case,
+                    levels = c("Confirmed",
+                               "Recovered",
+                               "Death")) ~ factor(months(Date), 
+                                                  levels = c("March","April")),
+             scales = "free",
+             space = "fixed",
+             switch = "y") +
+  # facet_grid(Case~months(Date), scales = "free") + #free
+  labs(fill = "", y = "", x = "") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 25, family = "Times"),
+        legend.position = "none",
+        panel.border = element_rect(fill = NA),
+        plot.margin = unit(c(0.5, 0.5, -0.5, -0.5), "cm")) #top, right, bottom, left
+ggsave("Figures/Validation.png",
+       width = 18, height = 15, units = "cm")
+```
+
+```{r message=FALSE, warning=FALSE, fig.height = 6, fig.width = 10, fig.cap = "\\label{fig:simulation}Simulation till the end of the year."}
+val.aux = bind_cols(p2.1 %>% dplyr::select(-c(Serie)), as_tibble(p2.2$Count))
+colnames(val.aux) = c("Date", "Case", "Real", "Simulation")
+
+val.aux$Week = as.numeric(format(val.aux$Date, "%V"))
+val.aux$Week = as.factor(val.aux$Week)
+
+val.aux %>%
+  ggplot(aes(x = Real/1000, y = Simulation/1000, col = Simulation >= Real)) + geom_point(alpha = 1) +
+  # geom_smooth(method = lm, se = TRUE) +
+  # geom_smooth(method = lm, formula = y ~ splines::bs(x, 3), se = TRUE) +
+  facet_grid(factor(Case,
+                    levels = c("Confirmed",
+                               "Recovered",
+                               "Death")) ~ factor(months(Date), 
+                                                  levels = c("March","April")),
+             scales = "free",
+             space = "fixed",
+             switch = "y") +
+  # facet_grid(Case~months(Date), scales = "free") + #free
+  labs(col = "", y = "Simulation", x = "Real") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 25, family = "Times"),
+        axis.text.x = element_text(size = 15, family = "Times"),
+        axis.text.y = element_text(size = 15, family = "Times"),
+        legend.position = "bottom",
+        panel.border = element_rect(fill = NA),
+        plot.margin = unit(c(0.5, 0.5, 0, 0.1), "cm")) #top, right, bottom, left
+ggsave("Figures/Validation1.png",
+       width = 20, height = 15, units = "cm")
+```
+
+```{r}
+n.sim = 1000
+a = data.frame(Fold = rep(1:n.sim, 1, each = length(horizon)),
+               Row = rep(horizon, n.sim),
+               Confirmed = rep(datos$Confirmed, n.sim),
+               Recovered = 0,
+               Death = 0)
+
+set.seed(params$seed)
+
+for (i in 1:nrow(a)) {
+  cnt = ifelse(i%%nrow(datos) != 0, i%%nrow(datos), 1) # contador
+  a[i, 4] = ifelse(datos$Recovered[cnt] != 0,
+                        datos$Recovered[cnt + round(sample(tr_post, 1))], 0)
+  a[i, 5] = ifelse(datos$Death[cnt] != 0,
+                        datos$Death[cnt + round(sample(td_post, 1))], 0)
+}
+
+paste("There are", sum(is.na(a)), "over", nrow(a), "rows with missing values")
+# a = na.omit(a)
+# a$Row = 1:nrow(a)
+```
+
+```{r}
+g1 = a %>%
+  replace(is.na(.), 0) %>%
+  gather(key = "Case", value = "Count", -Row, -Fold, factor_key = TRUE) %>%
+  filter(Row <= max(Row) - max(c(td_post, tr_post))) %>%
+  ggplot() +
+  geom_bar(aes(x = Row, fill = factor(Case, levels = c("Confirmed", "Recovered", "Death")),
+               weight = Count),
+           position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  geom_hline(yintercept = 0.5,
+             linetype = "twodash") +
+  labs(fill = "", y = "", x = "") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 25, family = "Times"),
+        axis.text.x = element_text(size = 15, family = "Times"),
+        axis.text.y = element_text(size = 15, family = "Times"),
+        legend.position = "bottom",
+        panel.border = element_rect(fill = NA),
+        plot.margin = unit(c(0.5, 0.5, 0, 0.1), "cm")) #top, right, bottom, left
+print(g1)
+ggsave("Figures/Validation2.png",
+       width = 20, height = 15, units = "cm")
+```
+
+```{r}
+b = data.frame(Fold = rep(1:n.sim, 1, each = length(horizon)),
+               Row = rep(horizon, n.sim),
+               Confirmed = rep(sim$Confirmed, n.sim),
+               Recovered = 0,
+               Death = 0)
+
+set.seed(params$seed)
+
+for (i in 1:nrow(b)) {
+  # cnt = ifelse(i%%nrow(sim) != 0, i%%nrow(sim), 1) # contador
+  # b[i, 4] = x.sr*ifelse(sim$Recovered[cnt] != 0,
+  #                       sim$Recovered[cnt + round(sample(tr_post, 1))], 0)
+  # b[i, 5] = x.sd*ifelse(sim$Death[cnt] != 0,
+  #                       sim$Death[cnt + round(sample(td_post, 1))], 0)
+  b[i, 4] = sim$Recovered[i%%nrow(sim) + round(sample(tr_post, 1))]
+  b[i, 5] = sim$Death[i%%nrow(sim) + round(sample(td_post, 1))]
+}
+
+paste("There are", sum(is.na(b)), "over", nrow(b), "rows with missing values")
+# a = na.omit(a)
+# a$Row = 1:nrow(a)
+```
+
+```{r}
+g2 = b %>%
+  replace(is.na(.), 0) %>%
+  gather(key = "Case", value = "Count", -Row, -Fold, factor_key = TRUE) %>%
+  filter(Row <= max(Row) - max(c(td_post, tr_post))) %>%
+  ggplot() +
+  geom_bar(aes(x = Row, fill = factor(Case, levels = c("Confirmed", "Recovered", "Death")),
+               weight = Count),
+           position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  geom_hline(yintercept = 0.5,
+             linetype = "twodash") +
+  labs(fill = "", y = "", x = "") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 25, family = "Times"),
+        axis.text.x = element_text(size = 15, family = "Times"),
+        axis.text.y = element_text(size = 15, family = "Times"),
+        legend.position = "bottom",
+        panel.border = element_rect(fill = NA),
+        plot.margin = unit(c(0.5, 0.5, 0, 0.1), "cm")) #top, right, bottom, left
+print(g2)
+ggsave("Figures/Validation3.png",
+       width = 20, height = 15, units = "cm")
+```
+
+```{r message=FALSE, warning=FALSE, fig.height = 10, fig.width = 5, fig.cap = "\\label{fig:posteriors}Posterior distributions for intensities and elapsed times."}
+ggpubr::ggarrange(g1, g2, labels = c("a)", "b)"), common.legend = TRUE,
+                  legend = "bottom", align = "h", nrow = 1)
+ggsave("Figures/Validation4.png", width = 30, height = 15, units = "cm")
+```
+
