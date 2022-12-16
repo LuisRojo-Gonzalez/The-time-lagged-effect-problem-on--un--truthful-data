@@ -1,3 +1,6 @@
 *.tex linguist-vendored
 *.cls linguist-vendored
 *.Rmd  linguist-detectable
+
+app/* linguist-documentation=false
+app/* linguist-vendored
